@@ -1,0 +1,5 @@
+venv/
+*.pkl
+__pycache__/
+debug_output.wav
+debug_final.wav
