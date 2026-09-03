@@ -67,6 +67,15 @@ async def recognize(audio: UploadFile = File(...)):
 
     return {"detectedChord": chord}
 
+
+#overall process that got things working:
+# Live mic at 48 kHz
+# → ignore quiet room noise
+# → detect real strum
+# → cut a five-second window around that strum
+# → resample correctly to 22.05 kHz
+# → compute the same Mel spectrogram features used in training
+# → predict chord
 @app.websocket("/ws/recognize")
 async def ws_recognize(websocket: WebSocket):
     await websocket.accept()
@@ -129,10 +138,10 @@ async def ws_recognize(websocket: WebSocket):
                 start = max(0, onset_position - pre_roll)
                 window = audio_buffer[start : start + needed_total]
 
-                # DEBUG — save exactly what we're about to classify so you can listen to it
-                debug_filename = f"debug_trigger_{int(time.time())}.wav"
-                sf.write(debug_filename, window, BROWSER_SR)
-                print(f"Saved {debug_filename}")
+                # # DEBUG — save exactly what we're about to classify so you can listen to it
+                # debug_filename = f"debug_trigger_{int(time.time())}.wav"
+                # sf.write(debug_filename, window, BROWSER_SR)
+                # print(f"Saved {debug_filename}")
 
                 y_resampled = librosa.resample(window, orig_sr=BROWSER_SR, target_sr=TARGET_SR)
 
