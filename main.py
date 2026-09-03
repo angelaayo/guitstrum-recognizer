@@ -5,11 +5,13 @@ import librosa
 import numpy as np
 import joblib
 import io
+import soundfile as sf
+import time
 
 TARGET_SR = 22050
-BROWSER_SR = 44100
-BUFFER_SECONDS = 5
-
+BROWSER_SR = 48000
+WINDOW_SECONDS = 5
+CHECK_INTERVAL_SAMPLES = int(BROWSER_SR * 0.25) # we check for onsets every 250ms of new audio
 
 app = FastAPI()
 
@@ -71,30 +73,91 @@ async def ws_recognize(websocket: WebSocket):
     print("Client connected")
 
     audio_buffer = np.array([], dtype=np.float32)
+    samples_since_last_check = 0
+    total_samples_received = 0
+    cooldown_until = 0  # so we don't retrigger on the same strum's fade out
 
     try:
         while True:
             data = await websocket.receive_bytes()
             chunk = np.frombuffer(data, dtype=np.float32)
             audio_buffer = np.concatenate([audio_buffer, chunk])
+            samples_since_last_check += len(chunk)
+            total_samples_received += len(chunk)
 
-            #trying to aquire out 5 second window
+            # cap the buffer so it doesn't grow forever
+            max_buffer_samples = BROWSER_SR * (WINDOW_SECONDS + 1)
+            if len(audio_buffer) > max_buffer_samples:
+                audio_buffer = audio_buffer[-max_buffer_samples:]
 
-            if len(audio_buffer) >= BROWSER_SR * BUFFER_SECONDS:
-                window = audio_buffer[: BROWSER_SR * BUFFER_SECONDS]
-                audio_buffer = audio_buffer[BROWSER_SR * BUFFER_SECONDS:]
-                try:
-                    y_resampled = librosa.resample(window, orig_sr=BROWSER_SR, target_sr=TARGET_SR)
-                    target_samples = BUFFER_SECONDS * TARGET_SR
-                    if len(y_resampled) > target_samples:
-                        y_fixed = y_resampled[:target_samples]
-                    else:
-                        padding = max(0, target_samples - len(y_resampled))
-                        y_fixed = np.pad(y_resampled, (0, padding), mode="constant")
-                    chord  = getChord(y_fixed, TARGET_SR)
-                    print(f"Predicted: {chord}")
-                    await websocket.send_json({"detectedChord": chord})
-                except Exception as e:
-                    print(f"Prediction error: {e}")
+            if samples_since_last_check < CHECK_INTERVAL_SAMPLES:
+                continue
+            samples_since_last_check = 0
+
+            if len(audio_buffer) < BROWSER_SR:
+                continue
+
+            recent = audio_buffer[-BROWSER_SR:]
+
+            recent_rms = np.sqrt(np.mean(recent ** 2))
+            if recent_rms < 0.01:
+                continue
+            onset_env = librosa.onset.onset_strength(y=recent, sr=BROWSER_SR)
+
+            if(
+                onset_env.max() > max(np.median(onset_env) * 5, 0.1)
+                and total_samples_received >= cooldown_until
+            ):
+                print("Strum detected, capturing window with onset near the start...")
+
+                onset_frame = int(np.argmax(onset_env))
+                onset_in_recent = librosa.frames_to_samples(onset_frame)
+                recent_start = len(audio_buffer) - len(recent)
+
+                onset_position = recent_start + onset_in_recent
+                pre_roll = int(BROWSER_SR * 0.1)      # small lead-in, mirroring training's ~0.07s onset
+                needed_total = BROWSER_SR * WINDOW_SECONDS
+
+                # keep receiving audio until we've accumulated a full window
+                # that starts just before the detected onset
+                while (len(audio_buffer) - (onset_position - pre_roll)) < needed_total:
+                    data = await websocket.receive_bytes()
+                    chunk = np.frombuffer(data, dtype=np.float32)
+                    audio_buffer = np.concatenate([audio_buffer, chunk])
+                    total_samples_received += len(chunk)
+
+                start = max(0, onset_position - pre_roll)
+                window = audio_buffer[start : start + needed_total]
+
+                # DEBUG — save exactly what we're about to classify so you can listen to it
+                debug_filename = f"debug_trigger_{int(time.time())}.wav"
+                sf.write(debug_filename, window, BROWSER_SR)
+                print(f"Saved {debug_filename}")
+
+                y_resampled = librosa.resample(window, orig_sr=BROWSER_SR, target_sr=TARGET_SR)
+
+                target_samples = WINDOW_SECONDS * TARGET_SR
+                if len(y_resampled) > target_samples:
+                    y_fixed = y_resampled[:target_samples]
+                else:
+                    padding = max(0, target_samples - len(y_resampled))
+                    y_fixed = np.pad(y_resampled, (0, padding), mode="constant")
+
+                print(f"Peak amplitude: {np.abs(y_fixed).max():.4f}, "
+                      f"Clipped samples: {np.sum(np.abs(y_fixed) >= 0.99)}")
+
+                chord = getChord(y_fixed, TARGET_SR)
+                print(f"Predicted: {chord}")
+                await websocket.send_json({"detectedChord": chord})
+
+                cooldown_until = total_samples_received + BROWSER_SR * 3
+                audio_buffer = audio_buffer[start + needed_total :]  # drop what we just used
+
+            else:
+                print(
+                    f"No trigger — max: {onset_env.max():.2f}, "
+                    f"median*3: {np.median(onset_env) * 5:.2f}, "
+                    f"total received: {total_samples_received}, cooldown_until: {cooldown_until}"
+                )
     except WebSocketDisconnect:
         print("Client disconnected")
