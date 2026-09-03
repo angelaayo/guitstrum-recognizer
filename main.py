@@ -10,6 +10,7 @@ TARGET_SR = 22050
 BROWSER_SR = 44100
 BUFFER_SECONDS = 5
 
+
 app = FastAPI()
 
 model = joblib.load("chord_model.pkl")
@@ -23,7 +24,7 @@ app.add_middleware(
 )
 
 def getChord(y, sr):
-    S = librosa.feature.melspectogram(y=y, sr=sr, n_mels=128)
+    S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
     S_db_mel = librosa.amplitude_to_db(S, ref=np.max)
     features = S_db_mel.reshape(1, -1)
     prediction = model.predict(features)
@@ -60,11 +61,7 @@ async def recognize(audio: UploadFile = File(...)):
         y_fixed = np.pad(y_trimmed, (0, padding), mode="constant")
     # import soundfile as sf
     # sf.write("debug_final.wav", y_trimmed, sr)
-    S = librosa.feature.melspectrogram(y=y_fixed, sr=sr, n_mels=128)
-    S_db_mel = librosa.amplitude_to_db(S, ref=np.max)
-    features = S_db_mel.reshape(1, -1)
-    prediction = model.predict(features)
-    chord = encoder.inverse_transform(prediction)[0]
+    chord = getChord(y_fixed, sr)
 
     return {"detectedChord": chord}
 
@@ -79,7 +76,7 @@ async def ws_recognize(websocket: WebSocket):
         while True:
             data = await websocket.receive_bytes()
             chunk = np.frombuffer(data, dtype=np.float32)
-            audio_buffer - np.concatenate([audio_buffer, chunk])
+            audio_buffer = np.concatenate([audio_buffer, chunk])
 
             #trying to aquire out 5 second window
 
