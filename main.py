@@ -9,9 +9,11 @@ import soundfile as sf
 import time
 
 TARGET_SR = 22050
-BROWSER_SR = 48000
-WINDOW_SECONDS = 5
-CHECK_INTERVAL_SAMPLES = int(BROWSER_SR * 0.25) # we check for onsets every 250ms of new audio
+BROWSER_SR = 44100  # Must match audioContext.sampleRate in the browser.
+MODEL_WINDOW_SECONDS = 5  # Fixed: the SVC was trained on five-second features.
+CAPTURE_SECONDS = 2.0  # Audio collected after a strum before predicting.
+DETECTION_WINDOW_SECONDS = 0.5
+CHECK_INTERVAL_SAMPLES = int(BROWSER_SR * 0.05)  # Check every 50 ms.
 
 app = FastAPI()
 
@@ -95,7 +97,9 @@ async def ws_recognize(websocket: WebSocket):
             total_samples_received += len(chunk)
 
             # cap the buffer so it doesn't grow forever
-            max_buffer_samples = BROWSER_SR * (WINDOW_SECONDS + 1)
+            max_buffer_samples = int(
+                BROWSER_SR * (CAPTURE_SECONDS + DETECTION_WINDOW_SECONDS + 1)
+            )
             if len(audio_buffer) > max_buffer_samples:
                 audio_buffer = audio_buffer[-max_buffer_samples:]
 
@@ -103,10 +107,11 @@ async def ws_recognize(websocket: WebSocket):
                 continue
             samples_since_last_check = 0
 
-            if len(audio_buffer) < BROWSER_SR:
+            detection_window_samples = int(BROWSER_SR * DETECTION_WINDOW_SECONDS)
+            if len(audio_buffer) < detection_window_samples:
                 continue
 
-            recent = audio_buffer[-BROWSER_SR:]
+            recent = audio_buffer[-detection_window_samples:]
 
             recent_rms = np.sqrt(np.mean(recent ** 2))
             if recent_rms < 0.01:
@@ -125,7 +130,7 @@ async def ws_recognize(websocket: WebSocket):
 
                 onset_position = recent_start + onset_in_recent
                 pre_roll = int(BROWSER_SR * 0.1)      # small lead-in, mirroring training's ~0.07s onset
-                needed_total = BROWSER_SR * WINDOW_SECONDS
+                needed_total = int(BROWSER_SR * CAPTURE_SECONDS)
 
                 # keep receiving audio until we've accumulated a full window
                 # that starts just before the detected onset
@@ -145,7 +150,8 @@ async def ws_recognize(websocket: WebSocket):
 
                 y_resampled = librosa.resample(window, orig_sr=BROWSER_SR, target_sr=TARGET_SR)
 
-                target_samples = WINDOW_SECONDS * TARGET_SR
+                # Preserve the exact five-second feature shape the trained SVC expects.
+                target_samples = MODEL_WINDOW_SECONDS * TARGET_SR
                 if len(y_resampled) > target_samples:
                     y_fixed = y_resampled[:target_samples]
                 else:
