@@ -9,11 +9,12 @@ import soundfile as sf
 import time
 
 TARGET_SR = 22050
-BROWSER_SR = 44100  # Must match audioContext.sampleRate in the browser.
+BROWSER_SR = 44100 # Must match audioContext.sampleRate in the browser.
 MODEL_WINDOW_SECONDS = 5  # Fixed: the SVC was trained on five-second features.
 CAPTURE_SECONDS = 2.0  # Audio collected after a strum before predicting.
 DETECTION_WINDOW_SECONDS = 0.5
 CHECK_INTERVAL_SAMPLES = int(BROWSER_SR * 0.05)  # Check every 50 ms.
+CONFIDENCE_FLOOR = 0.55  # dont report a guess under this accuracy percent
 
 app = FastAPI()
 
@@ -31,10 +32,13 @@ def getChord(y, sr):
     S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
     S_db_mel = librosa.amplitude_to_db(S, ref=np.max)
     features = S_db_mel.reshape(1, -1)
-    prediction = model.predict(features)
-    chord = encoder.inverse_transform(prediction)[0]
 
-    return chord
+    probs = model.predict_proba(features)[0]
+    best_idx = np.argmax(probs)
+    chord = encoder.classes_[best_idx]
+    confidence = float(probs[best_idx])
+
+    return chord, confidence
 
 
 
@@ -161,9 +165,13 @@ async def ws_recognize(websocket: WebSocket):
                 print(f"Peak amplitude: {np.abs(y_fixed).max():.4f}, "
                       f"Clipped samples: {np.sum(np.abs(y_fixed) >= 0.99)}")
 
-                chord = getChord(y_fixed, TARGET_SR)
-                print(f"Predicted: {chord}")
-                await websocket.send_json({"detectedChord": chord})
+                chord, confidence = getChord(y_fixed, TARGET_SR)
+                print(f"Predicted: {chord} ({confidence:.2%} confidence)")
+
+                if confidence >= CONFIDENCE_FLOOR:
+                    await websocket.send_json({"detectedChord": chord, "confidence": confidence})
+                else:
+                    print("Below confidence floor - treating as noise, not sending")
 
                 cooldown_until = total_samples_received + BROWSER_SR * 3
                 audio_buffer = audio_buffer[start + needed_total :]  # drop what we just used
