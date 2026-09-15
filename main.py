@@ -9,11 +9,11 @@ import soundfile as sf
 import time
 
 TARGET_SR = 22050
-BROWSER_SR = 44100 # Must match audioContext.sampleRate in the browser.
+# BROWSER_SR = 44100 # Must match audioContext.sampleRate in the browser.
 MODEL_WINDOW_SECONDS = 5  # Fixed: the SVC was trained on five-second features.
 CAPTURE_SECONDS = 2.0  # Audio collected after a strum before predicting.
 DETECTION_WINDOW_SECONDS = 0.5
-CHECK_INTERVAL_SAMPLES = int(BROWSER_SR * 0.05)  # Check every 50 ms.
+# CHECK_INTERVAL_SAMPLES = int(BROWSER_SR * 0.05)  # Check every 50 ms.
 CONFIDENCE_FLOOR = 0.55  # dont report a guess under this accuracy percent
 
 app = FastAPI()
@@ -85,12 +85,20 @@ async def recognize(audio: UploadFile = File(...)):
 @app.websocket("/ws/recognize")
 async def ws_recognize(websocket: WebSocket):
     await websocket.accept()
-    print("Client connected")
+
+    try:
+        browser_sr = int(websocket.query_params.get("sampleRate", 44100))
+    except (TypeError, ValueError):
+        browser_sr = 44100
+
+    check_interval_samples = int(browser_sr * 0.05)  # recomputed per connection now
+
+    print(f"Client connected — browser sample rate: {browser_sr}Hz")
 
     audio_buffer = np.array([], dtype=np.float32)
     samples_since_last_check = 0
     total_samples_received = 0
-    cooldown_until = 0  # so we don't retrigger on the same strum's fade out
+    cooldown_until = 0
 
     try:
         while True:
@@ -100,18 +108,17 @@ async def ws_recognize(websocket: WebSocket):
             samples_since_last_check += len(chunk)
             total_samples_received += len(chunk)
 
-            # cap the buffer so it doesn't grow forever
             max_buffer_samples = int(
-                BROWSER_SR * (CAPTURE_SECONDS + DETECTION_WINDOW_SECONDS + 1)
+                browser_sr * (CAPTURE_SECONDS + DETECTION_WINDOW_SECONDS + 1)
             )
             if len(audio_buffer) > max_buffer_samples:
                 audio_buffer = audio_buffer[-max_buffer_samples:]
 
-            if samples_since_last_check < CHECK_INTERVAL_SAMPLES:
+            if samples_since_last_check < check_interval_samples:
                 continue
             samples_since_last_check = 0
 
-            detection_window_samples = int(BROWSER_SR * DETECTION_WINDOW_SECONDS)
+            detection_window_samples = int(browser_sr * DETECTION_WINDOW_SECONDS)
             if len(audio_buffer) < detection_window_samples:
                 continue
 
@@ -120,9 +127,9 @@ async def ws_recognize(websocket: WebSocket):
             recent_rms = np.sqrt(np.mean(recent ** 2))
             if recent_rms < 0.01:
                 continue
-            onset_env = librosa.onset.onset_strength(y=recent, sr=BROWSER_SR)
+            onset_env = librosa.onset.onset_strength(y=recent, sr=browser_sr)
 
-            if(
+            if (
                 onset_env.max() > max(np.median(onset_env) * 5, 0.1)
                 and total_samples_received >= cooldown_until
             ):
@@ -133,11 +140,9 @@ async def ws_recognize(websocket: WebSocket):
                 recent_start = len(audio_buffer) - len(recent)
 
                 onset_position = recent_start + onset_in_recent
-                pre_roll = int(BROWSER_SR * 0.1)      # small lead-in, mirroring training's ~0.07s onset
-                needed_total = int(BROWSER_SR * CAPTURE_SECONDS)
+                pre_roll = int(browser_sr * 0.1)
+                needed_total = int(browser_sr * CAPTURE_SECONDS)
 
-                # keep receiving audio until we've accumulated a full window
-                # that starts just before the detected onset
                 while (len(audio_buffer) - (onset_position - pre_roll)) < needed_total:
                     data = await websocket.receive_bytes()
                     chunk = np.frombuffer(data, dtype=np.float32)
@@ -147,14 +152,8 @@ async def ws_recognize(websocket: WebSocket):
                 start = max(0, onset_position - pre_roll)
                 window = audio_buffer[start : start + needed_total]
 
-                # # DEBUG — save exactly what we're about to classify so you can listen to it
-                # debug_filename = f"debug_trigger_{int(time.time())}.wav"
-                # sf.write(debug_filename, window, BROWSER_SR)
-                # print(f"Saved {debug_filename}")
+                y_resampled = librosa.resample(window, orig_sr=browser_sr, target_sr=TARGET_SR)
 
-                y_resampled = librosa.resample(window, orig_sr=BROWSER_SR, target_sr=TARGET_SR)
-
-                # Preserve the exact five-second feature shape the trained SVC expects.
                 target_samples = MODEL_WINDOW_SECONDS * TARGET_SR
                 if len(y_resampled) > target_samples:
                     y_fixed = y_resampled[:target_samples]
@@ -173,13 +172,13 @@ async def ws_recognize(websocket: WebSocket):
                 else:
                     print("Below confidence floor - treating as noise, not sending")
 
-                cooldown_until = total_samples_received + BROWSER_SR * 3
-                audio_buffer = audio_buffer[start + needed_total :]  # drop what we just used
+                cooldown_until = total_samples_received + browser_sr * 3
+                audio_buffer = audio_buffer[start + needed_total :]
 
             else:
                 print(
                     f"No trigger — max: {onset_env.max():.2f}, "
-                    f"median*3: {np.median(onset_env) * 5:.2f}, "
+                    f"median*5: {np.median(onset_env) * 5:.2f}, "
                     f"total received: {total_samples_received}, cooldown_until: {cooldown_until}"
                 )
     except WebSocketDisconnect:
