@@ -9,17 +9,15 @@ import soundfile as sf
 import time
 
 TARGET_SR = 22050
-BROWSER_SR = 44100  # Must match audioContext.sampleRate in the browser.
 MODEL_WINDOW_SECONDS = 5  # Fixed: the SVC was trained on five-second features.
 CAPTURE_SECONDS = 2.0  # Audio collected after a strum before predicting.
 DETECTION_WINDOW_SECONDS = 0.5
-CHECK_INTERVAL_SAMPLES = int(BROWSER_SR * 0.05)  # Check every 50 ms.
+CONFIDENCE_FLOOR = 0.45
 
 app = FastAPI()
 
 model = joblib.load("chord_model.pkl")
 encoder = joblib.load("chord_encoder.pkl")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,10 +29,12 @@ def getChord(y, sr):
     S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
     S_db_mel = librosa.amplitude_to_db(S, ref=np.max)
     features = S_db_mel.reshape(1, -1)
-    prediction = model.predict(features)
-    chord = encoder.inverse_transform(prediction)[0]
+    probabilities = model.predict_proba(features)[0]
+    best_index = np.argmax(probabilities)
+    chord = encoder.classes_[best_index]
+    confidence = float(probabilities[best_index])
 
-    return chord
+    return chord, confidence
 
 
 
@@ -65,9 +65,9 @@ async def recognize(audio: UploadFile = File(...)):
         y_fixed = np.pad(y_trimmed, (0, padding), mode="constant")
     # import soundfile as sf
     # sf.write("debug_final.wav", y_trimmed, sr)
-    chord = getChord(y_fixed, sr)
+    chord, confidence = getChord(y_fixed, sr)
 
-    return {"detectedChord": chord}
+    return {"detectedChord": chord, "confidence": confidence}
 
 
 #overall process that got things working:
@@ -81,7 +81,13 @@ async def recognize(audio: UploadFile = File(...)):
 @app.websocket("/ws/recognize")
 async def ws_recognize(websocket: WebSocket):
     await websocket.accept()
-    print("Client connected")
+    try:
+        browser_sr = int(websocket.query_params.get("sampleRate", 48000))
+    except (TypeError, ValueError):
+        browser_sr = 48000
+
+    check_interval_samples = int(browser_sr * 0.05)
+    print(f"Client connected — browser sample rate: {browser_sr} Hz")
 
     audio_buffer = np.array([], dtype=np.float32)
     samples_since_last_check = 0
@@ -98,16 +104,16 @@ async def ws_recognize(websocket: WebSocket):
 
             # cap the buffer so it doesn't grow forever
             max_buffer_samples = int(
-                BROWSER_SR * (CAPTURE_SECONDS + DETECTION_WINDOW_SECONDS + 1)
+                browser_sr * (CAPTURE_SECONDS + DETECTION_WINDOW_SECONDS + 1)
             )
             if len(audio_buffer) > max_buffer_samples:
                 audio_buffer = audio_buffer[-max_buffer_samples:]
 
-            if samples_since_last_check < CHECK_INTERVAL_SAMPLES:
+            if samples_since_last_check < check_interval_samples:
                 continue
             samples_since_last_check = 0
 
-            detection_window_samples = int(BROWSER_SR * DETECTION_WINDOW_SECONDS)
+            detection_window_samples = int(browser_sr * DETECTION_WINDOW_SECONDS)
             if len(audio_buffer) < detection_window_samples:
                 continue
 
@@ -116,7 +122,7 @@ async def ws_recognize(websocket: WebSocket):
             recent_rms = np.sqrt(np.mean(recent ** 2))
             if recent_rms < 0.01:
                 continue
-            onset_env = librosa.onset.onset_strength(y=recent, sr=BROWSER_SR)
+            onset_env = librosa.onset.onset_strength(y=recent, sr=browser_sr)
 
             if(
                 onset_env.max() > max(np.median(onset_env) * 5, 0.1)
@@ -129,8 +135,8 @@ async def ws_recognize(websocket: WebSocket):
                 recent_start = len(audio_buffer) - len(recent)
 
                 onset_position = recent_start + onset_in_recent
-                pre_roll = int(BROWSER_SR * 0.1)      # small lead-in, mirroring training's ~0.07s onset
-                needed_total = int(BROWSER_SR * CAPTURE_SECONDS)
+                pre_roll = int(browser_sr * 0.1)
+                needed_total = int(browser_sr * CAPTURE_SECONDS)
 
                 # keep receiving audio until we've accumulated a full window
                 # that starts just before the detected onset
@@ -145,10 +151,10 @@ async def ws_recognize(websocket: WebSocket):
 
                 # # DEBUG — save exactly what we're about to classify so you can listen to it
                 # debug_filename = f"debug_trigger_{int(time.time())}.wav"
-                # sf.write(debug_filename, window, BROWSER_SR)
+                # sf.write(debug_filename, window, browser_sr)
                 # print(f"Saved {debug_filename}")
 
-                y_resampled = librosa.resample(window, orig_sr=BROWSER_SR, target_sr=TARGET_SR)
+                y_resampled = librosa.resample(window, orig_sr=browser_sr, target_sr=TARGET_SR)
 
                 # Preserve the exact five-second feature shape the trained SVC expects.
                 target_samples = MODEL_WINDOW_SECONDS * TARGET_SR
@@ -161,11 +167,18 @@ async def ws_recognize(websocket: WebSocket):
                 print(f"Peak amplitude: {np.abs(y_fixed).max():.4f}, "
                       f"Clipped samples: {np.sum(np.abs(y_fixed) >= 0.99)}")
 
-                chord = getChord(y_fixed, TARGET_SR)
-                print(f"Predicted: {chord}")
-                await websocket.send_json({"detectedChord": chord})
+                chord, confidence = getChord(y_fixed, TARGET_SR)
+                print(f"Predicted: {chord} ({confidence:.1%})")
 
-                cooldown_until = total_samples_received + BROWSER_SR * 3
+                if confidence >= CONFIDENCE_FLOOR:
+                    await websocket.send_json({
+                        "detectedChord": chord,
+                        "confidence": confidence,
+                    })
+                else:
+                    print("Below confidence floor; ignored.")
+
+                cooldown_until = total_samples_received + browser_sr * 3
                 audio_buffer = audio_buffer[start + needed_total :]  # drop what we just used
 
             else:
