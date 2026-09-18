@@ -1,0 +1,8 @@
+venv/
+wsl-env/
+wsl2-env/
+__pycache__/
+*.pyc
+debug_*.wav
+.git/
+.gitignore
