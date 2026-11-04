@@ -1,0 +1,31 @@
+# Production stack for an Oracle Cloud (or any) VM.
+# Caddy handles HTTPS/WSS on 80+443 and proxies to the recognizer container.
+#
+#   RECOGNIZER_DOMAIN=yoursub.duckdns.org docker compose -f docker-compose.prod.yml up -d --build
+#
+# See DEPLOY.md for the full VM setup runbook.
+services:
+  recognizer:
+    build: .
+    expose:
+      - "8000"
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      RECOGNIZER_DOMAIN: ${RECOGNIZER_DOMAIN:?set RECOGNIZER_DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - recognizer
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
