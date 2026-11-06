@@ -19,6 +19,6 @@ docker run -p 8000:8000 guitstrum-recognizer
 
 ## Deploy (production, free)
 
-Runs on a free Oracle Cloud "Always Free" VM behind Caddy, which provides
-automatic HTTPS so the browser can reach it over `wss://`. See
-[DEPLOY.md](DEPLOY.md) for the full runbook.
+Deployed on Render's free tier as a Docker web service (see `render.yaml`).
+Render provides HTTPS/`wss://` automatically and injects `$PORT`, which the
+Dockerfile binds. In Render: New → Blueprint → connect this repo → Apply.

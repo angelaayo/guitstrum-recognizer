@@ -1,7 +1,0 @@
-# Caddy terminates TLS and reverse-proxies to the recognizer.
-# It automatically obtains and renews a Let's Encrypt certificate for the
-# domain, which is what lets the browser connect over wss:// (secure WebSocket).
-# RECOGNIZER_DOMAIN is supplied via the environment (see .env.prod.example).
-{$RECOGNIZER_DOMAIN} {
-	reverse_proxy recognizer:8000
-}
