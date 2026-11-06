@@ -1,0 +1,10 @@
+# Render Blueprint. In Render: New → Blueprint → connect this repo → Apply.
+# Deploys the recognizer as a free Docker web service with a health check.
+services:
+  - type: web
+    name: guitstrum-recognizer
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    autoDeploy: true
