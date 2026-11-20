@@ -1,27 +1,23 @@
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
-from pydub import AudioSegment
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import librosa
 import numpy as np
-import joblib
-import io
-import soundfile as sf
-import time
+import onnxruntime as ort
 
 TARGET_SR = 22050
-MODEL_WINDOW_SECONDS = 5  # Fixed: the SVC was trained on five-second features.
+N_SAMPLES = 43844  # Basic Pitch's fixed ~2s input window at 22050 Hz.
 CAPTURE_SECONDS = 2.0  # Audio collected after a strum before predicting.
 DETECTION_WINDOW_SECONDS = 0.5
-CONFIDENCE_FLOOR = 0.45
 
 app = FastAPI()
 
 @app.get("/health")
 def health():
-    return{"status": "ok"}
+    return {"status": "ok"}
 
-model = joblib.load("chord_model.pkl")
-encoder = joblib.load("chord_encoder.pkl")
+NOTE_MODEL = ort.InferenceSession("models/nmp.onnx", providers=["CPUExecutionProvider"])
+NOTE_INPUT = NOTE_MODEL.get_inputs()[0].name
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,61 +25,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def getChord(y, sr):
-    S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
-    S_db_mel = librosa.amplitude_to_db(S, ref=np.max)
-    features = S_db_mel.reshape(1, -1)
-    probabilities = model.predict_proba(features)[0]
-    best_index = np.argmax(probabilities)
-    chord = encoder.classes_[best_index]
-    confidence = float(probabilities[best_index])
 
-    return chord, confidence
+def get_note_profile(y):
+    # y is already 22050 Hz mono; shape to the model's fixed window.
+    x = y[:N_SAMPLES] if len(y) >= N_SAMPLES else np.pad(y, (0, N_SAMPLES - len(y)))
+    x = x.reshape(1, N_SAMPLES, 1).astype(np.float32)
+    outputs = NOTE_MODEL.run(None, {NOTE_INPUT: x})
+    note = next(o for o in outputs if o.shape[-1] == 88)[0]  # (frames, 88)
+    return note.mean(axis=0)  # 88 values; bin i -> MIDI note 21+i (A0)
 
 
-
-# @app.post("/recognize")
-# async def recognize(audio: UploadFile = File(...)):
-#     #ensuring our audio is processed in the right format
-#     raw_bytes = await audio.read()
-#     audio_segment = AudioSegment.from_file(io.BytesIO(raw_bytes))
-#     wav_buffer = io.BytesIO()
-#     audio_segment.export(wav_buffer, format="wav")
-#     wav_buffer.seek(0)
-
-#     #based on our training on mel spectograms all our audio files need to be
-#     #the same length of 5 seconds
-
-#     target_duaration = 5
-#     y,sr = librosa.load(wav_buffer)
-#     #trim off silence in audio
-#     print(f"Raw audio: {len(y)/sr:.2f}s, sample rate: {sr}")
-#     y_trimmed, _ = librosa.effects.trim(y, top_db=34)
-#     print(f"After trim: {len(y_trimmed)/sr:.2f}s")
-
-#     target_samples = target_duaration * sr
-#     if len(y_trimmed) > target_samples:
-#         y_fixed = y_trimmed[:target_samples]
-#     else:
-#         padding = target_samples - len(y_trimmed)
-#         y_fixed = np.pad(y_trimmed, (0, padding), mode="constant")
-#     # import soundfile as sf
-#     # sf.write("debug_final.wav", y_trimmed, sr)
-#     chord, confidence = getChord(y_fixed, sr)
-
-#     return {"detectedChord": chord, "confidence": confidence}
-
-
-
-
-#overall process that got things working:
-# Live mic at 48 kHz
-# → ignore quiet room noise
-# → detect real strum
-# → cut a five-second window around that strum
-# → resample correctly to 22.05 kHz
-# → compute the same Mel spectrogram features used in training
-# → predict chord
 @app.websocket("/ws/recognize")
 async def ws_recognize(websocket: WebSocket):
     await websocket.accept()
@@ -155,34 +106,19 @@ async def ws_recognize(websocket: WebSocket):
                 start = max(0, onset_position - pre_roll)
                 window = audio_buffer[start : start + needed_total]
 
-                # # DEBUG — save exactly what we're about to classify so you can listen to it
-                # debug_filename = f"debug_trigger_{int(time.time())}.wav"
-                # sf.write(debug_filename, window, browser_sr)
-                # print(f"Saved {debug_filename}")
-
                 y_resampled = librosa.resample(window, orig_sr=browser_sr, target_sr=TARGET_SR)
 
-                # Preserve the exact five-second feature shape the trained SVC expects.
-                target_samples = MODEL_WINDOW_SECONDS * TARGET_SR
-                if len(y_resampled) > target_samples:
-                    y_fixed = y_resampled[:target_samples]
-                else:
-                    padding = max(0, target_samples - len(y_resampled))
-                    y_fixed = np.pad(y_resampled, (0, padding), mode="constant")
+                print(f"Peak amplitude: {np.abs(y_resampled).max():.4f}, "
+                      f"Clipped samples: {np.sum(np.abs(y_resampled) >= 0.99)}")
 
-                print(f"Peak amplitude: {np.abs(y_fixed).max():.4f}, "
-                      f"Clipped samples: {np.sum(np.abs(y_fixed) >= 0.99)}")
+                profile = get_note_profile(y_resampled)
+                top = np.argsort(profile)[::-1][:3]
+                print("Top notes (midi, strength):",
+                      [(21 + int(i), round(float(profile[i]), 3)) for i in top])
 
-                chord, confidence = getChord(y_fixed, TARGET_SR)
-                print(f"Predicted: {chord} ({confidence:.1%})")
-
-                if confidence >= CONFIDENCE_FLOOR:
-                    await websocket.send_json({
-                        "detectedChord": chord,
-                        "confidence": confidence,
-                    })
-                else:
-                    print("Below confidence floor; ignored.")
+                await websocket.send_json({
+                    "notes": [round(float(v), 4) for v in profile],
+                })
 
                 cooldown_until = total_samples_received + browser_sr * 3
                 audio_buffer = audio_buffer[start + needed_total :]  # drop what we just used
